@@ -1,0 +1,391 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import re
+import signal
+from argparse import ArgumentParser
+from tank_api_client.help_maker import LOG_FILENAME_DEFAULT, LOGGER_NAME, \
+    SCRIPT_DESC, LT_PATH_HELP, LOG_FILENAME_HELP, VERBOSE_HELP, \
+    QUIET_HELP, SERVER_HOST_DEFAULT, \
+    SERVER_PORT_DEFAULT, API_WORK_DIR_HELP, DAYS_HELP, \
+    SERVER_HOST_HELP, SERVER_PORT_HELP, COMMON_INI_HELP, \
+    COMMON_INI_DEFAULT, DAYS_DEFAULT, GIT_PULL_HELP, VERSION_HELP, \
+    MODE_HELP
+from tank_api_client.config_reader import ConfigReader
+import logging
+from tank_api_client.logger import Logger
+from tank_api_client.api_client import TankClient, TankClientError
+from datetime import datetime, date, timedelta
+from tank_api_client.saltsclient import SaltsClient
+from tank_api_client.confighelper import CustomConfig
+import time
+from requests.auth import AuthBase
+import ConfigParser
+import git
+import shutil
+import pkg_resources
+import json
+
+SPUTNIK_SEC = 'salts_report'
+SALTS_SEC = 'salts'
+PHANTOM_SEC = 'phantom'
+JMETER_SEC = 'jmeter'
+GRAPHITE_SEC = 'graphite'
+TANK_SEC = 'tank'
+POLL_INTERVAL = 5
+WAIT_FOR_RESULT_SAVED = 60
+
+
+def stg_completed_to_bool(value):
+    if type(value) is bool:
+        return value
+
+    return value.lower() == "true"
+
+
+def parse_options():
+    parser = ArgumentParser(description=SCRIPT_DESC)
+    parser.add_argument("-g", "--git-pull",
+                        dest="git_pull",
+                        action="store_true",
+                        default=False,
+                        help=GIT_PULL_HELP)
+    parser.add_argument("-p", "--loadtest-path",
+                        dest="lt_path",
+                        default=os.getcwd(),
+                        help=LT_PATH_HELP)
+    parser.add_argument("-w", "--api-work-dir",
+                        dest="api_work_dir",
+                        help=API_WORK_DIR_HELP)
+    parser.add_argument("-d", "--days",
+                        dest="days",
+                        default=DAYS_DEFAULT,
+                        help=DAYS_HELP)
+    parser.add_argument("-l", "--log-filename",
+                        dest="log_filename",
+                        default=LOG_FILENAME_DEFAULT,
+                        help=LOG_FILENAME_HELP)
+    parser.add_argument("-c", "--common-ini",
+                        dest="common_ini",
+                        default=COMMON_INI_DEFAULT,
+                        help=COMMON_INI_HELP)
+    parser.add_argument("-s", "--server-host",
+                        dest="host",
+                        default=SERVER_HOST_DEFAULT,
+                        help=SERVER_HOST_HELP)
+    parser.add_argument("-r", "--server-port",
+                        dest="port",
+                        default=SERVER_PORT_DEFAULT,
+                        help=SERVER_PORT_HELP)
+    parser.add_argument("-v", "--verbose",
+                        dest="verbose",
+                        action="store_true", default=False,
+                        help=VERBOSE_HELP)
+    parser.add_argument("-m", "--mode",
+                        dest="mode",
+                        choices=['client', 'server'], default='client',
+                        help=MODE_HELP)
+    parser.add_argument("-q", "--quiet",
+                        dest="quiet",
+                        action="store_true", default=False,
+                        help=QUIET_HELP)
+    parser.add_argument("-V", '--version',
+                        dest="version",
+                        action="store_true", default=False,
+                        help=VERSION_HELP)
+    options = parser.parse_args()
+    return options
+
+
+def getDelta(start, finish):
+    duration = abs(finish - start)
+    len_mcs = duration.microseconds
+
+    if len_mcs >= 0.5 * (10 ** 6):
+        duration += timedelta(0, 1)
+    duration -= timedelta(0, 0, len_mcs)
+
+    return str(duration)
+
+
+class DRFApikeyAuth(AuthBase):
+    def __init__(self, apikey):
+        self.apikey = apikey
+
+    def __call__(self, r):
+        r.headers['Authorization'] = "Token {0}".format(self.apikey)
+        return r
+
+
+class SeriesRunner(object):
+    def __init__(self, options):
+        self._options = options
+        self._logger = Logger.get_logger(LOGGER_NAME,
+                                         self._options.log_filename,
+                                         self._options.verbose,
+                                         self._options.quiet)
+        self._ini_file = None
+        if os.path.isfile(self._options.lt_path):
+            self._ini_file = os.path.basename(self._options.lt_path)
+            absolute_ini_path = os.path.abspath(self._options.lt_path)
+            self._options.lt_path = os.path.dirname(absolute_ini_path)
+        self._options.lt_path = os.path.abspath(os.path.expanduser(self._options.lt_path))
+        ConfigReader.LT_PATH = self._options.lt_path
+        if self._options.mode == 'server':
+            ConfigReader.COMMON_INI = []
+        else:
+            ConfigReader.COMMON_INI = self._options.common_ini.split(",")
+        self._config_names = None
+        self._logger.info("RunLoad %s init ..." % pkg_resources.get_distribution("RunLoad").version)
+        self._ti = None
+        self._salts_client = None
+        signal.signal(signal.SIGINT, self.signal_handler)
+
+    def logger(self):
+        return self._logger
+
+    def signal_handler(self, sgn, frame):
+        print("\nНажмите [Y/y] и Enter, чтобы завершить текущий тест. Нажмите любую другую клавишу и Enter, чтобы продолжить ... ")
+        s = sys.stdin.readline()
+        if s in ['Y\n', 'y\n']:
+            if self._salts_client:
+                if self._ti and self._ti.get('session_id'):
+                    try:
+                        self._ti['status'] = 'I'
+                        self._ti['tank_host'] = self._options.host
+                        session_id = self._ti.pop('session_id')
+                        self._salts_client.update_shooting(session_id,
+                                                           **self._ti)
+                        self._logger.info("Session %s: the test interrupted." \
+                                          % session_id)
+                    except Exception, exc:
+                        self._logger.warning("Exception on Ctrl+C: %s" % exc)
+                else:
+                    self._logger.info("No running test.")
+                self._salts_client = None
+            else:
+                try:
+                    client = TankClient(self._options.host,
+                                        self._options.port)
+                    resp = client.status(self._ti.get('session_id'))
+                    client.stop(self._ti.get('session_id'))
+                    self._logger.info("Session %s: the test stopped." \
+                                      % self._ti.get('session_id'))
+                except Exception, exc:
+                    self._logger.info("Exception when test "
+                                      "has been interrupted: %s" % exc)
+            exit(0)
+
+    def git_pull(self):
+        try:
+            self._logger.info("Git Pull ...")
+            repo = git.Repo(path=self._options.lt_path,
+                            search_parent_directories=True)
+            o = repo.remotes.origin
+            fi = o.pull()[0]
+            if fi.old_commit:
+                self._logger.info(repo.git.diff(fi.old_commit, fi.commit))
+            ConfigReader.LT_PATH = repo.git.rev_parse("--show-toplevel")
+            ConfigReader.GIT_USED = True
+        except Exception, exc:
+            self._logger.warning("Git Pull Error: %s" % exc)
+
+    def run(self):
+        p = re.compile(".+\\.ini")
+        if self._ini_file:
+            if p.match(self._ini_file) and self._ini_file not in ConfigReader.COMMON_INI:
+                self._config_names = [self._ini_file]
+        else:
+            self._config_names = [f for f in os.listdir(self._options.lt_path)
+                                  if os.path.isfile(os.path.join(self._options.lt_path, f)) and p.match(f) and f not in ConfigReader.COMMON_INI]
+            self._config_names.sort()
+        self._logger.info("Config Names found: %s" % self._config_names)
+        for config in self._config_names:
+            self._run_test_api(config)
+
+    def remove_expired(self):
+        if not self._options.api_work_dir:
+            return
+
+        self._logger.info("Remove expired init ...")
+
+        artifacts_path = os.path.join(self._options.api_work_dir, "tests")
+        artifacts_dirs = [d for d in os.listdir(artifacts_path)
+                          if os.path.isdir(os.path.join(artifacts_path, d))]
+        for dir_name in artifacts_dirs:
+            artif_date = datetime.strptime(dir_name, "%Y%m%d%H%M%S_0000000000").date()
+            cur_date = date.today()
+            if cur_date - artif_date > timedelta(days=int(self._options.days)):
+                dir_path = os.path.join(artifacts_path, dir_name)
+                self._logger.info("Dir Path: %s" % dir_path)
+                shutil.rmtree(dir_path)
+                self._logger.info("%s directory was removed." % dir_name)
+
+    def _get_option_value(self, config, section, option, default_value):
+        try:
+            return config.get(section, option)
+        except ConfigParser.Error as e:
+            self._logger.info(e)
+            return default_value
+
+    def _get_test_info(self, config_name):
+        try:
+            test_info = {}
+            config_path = os.path.join(self._options.lt_path,
+                                       config_name)
+            cfg = ConfigReader(config_path)
+            self._logger.info("Read configs: %s" % cfg.get_read_configs())
+            file_path = cfg.save_ini()
+            self._logger.info("File Path: %s" % file_path)
+            test_info['file_path'] = file_path
+            cfg = ConfigParser.RawConfigParser()
+            cfg.read(file_path)
+            sections = cfg.sections()
+            sec_to_find = SALTS_SEC
+            if sec_to_find in sections:
+                test_info['api_url'] = self._get_option_value(cfg,
+                                                            SALTS_SEC,
+                                                            'api_url', '')
+                test_info['api_key'] = self._get_option_value(cfg,
+                                                            SALTS_SEC,
+                                                            'api_key', '')
+            if self._options.mode == 'server':
+                test_info['scenario_id'] = \
+                    self._get_option_value(cfg, SALTS_SEC,
+                                            'scenario_id', '')
+            if 'tank' in sections:
+                salts_value = self._get_option_value(cfg, 'tank',
+                                                     'plugin_salts', '')
+                test_info['salts'] = salts_value == 'yatank_Salts'
+                if test_info.get('salts'):
+                    test_info['scenario_id'] = \
+                        self._get_option_value(cfg, SALTS_SEC,
+                                               'scenario_id', '')
+                    if not test_info.get('scenario_id'):
+                        test_info['scenario_id'] = \
+                            self._get_option_value(cfg, SALTS_SEC,
+                                                   'test_ini_id', '')
+                        if test_info.get('scenario_id'):
+                            self._logger.warning(
+                                "'test_ini_id' option is "
+                                "deprecated. It won't be "
+                                "supported in future versions. "
+                                "Please use 'scenario_id' "
+                                "option instead of it.")
+            return test_info
+        except ConfigParser.Error as e:
+            self._logger.warning(e)
+            return {}
+
+    def _wait_for_completed(self, client, session_id, expected_retcode):
+        def format_resp(resp):
+            failures = resp.get('failures')
+            if failures:
+                for fail in failures:
+                    fail['reason'] = fail['reason'].split('\n')
+            return json.dumps(resp, indent=4)
+
+        while True:
+            resp = client.status(session_id)
+            if "stage_completed" in resp:
+                status = resp["status"]
+                completed = stg_completed_to_bool(resp["stage_completed"])
+                if expected_retcode:
+                    if resp["retcode"] is None:
+                        completed = False
+                if completed:
+                    self._logger.info(
+                        "Session %s: the test %s. Response: %s" \
+                        % (session_id, status, format_resp(resp)))
+                    break
+                self._logger.info(
+                    "Session %s: the test %s. Response: %s" \
+                    % (session_id, status, format_resp(resp)))
+            else:
+                self._logger.info("Response: %s" % format_resp(resp))
+            time.sleep(POLL_INTERVAL)
+
+    def _check_for_running(self, client):
+        resp = client.status()
+        for sess_id in resp:
+            if resp[sess_id]["status"] == "running":
+                msg = "The test can't start because other " \
+                      "test (session %s) is running now." \
+                      % sess_id
+                raise TankClientError(msg)
+
+    def _run_test_api(self, config):
+        self._logger.info("The test for %s config file is starting." % config)
+        self._ti = self._get_test_info(config)
+        if not self._ti.get('file_path'):
+            self._logger.warning("Result config file path "
+                                 "with extension 'tmp' is absent.")
+            return
+        if not (self._ti.get('api_url') and self._ti.get('api_key')):
+            self._logger.warning("api_url or api_key options "
+                                 "haven't been given.")
+            return
+        try:
+            if self._options.mode == 'server':
+                self._salts_client = SaltsClient(self._ti.get('api_url'),
+                                                 self._ti.get('api_key'),
+                                                 self._options.lt_path)
+                custom = CustomConfig(self._ti.get('file_path'))
+                self._salts_client.shoot(self._ti.get('scenario_id'),
+                                         (self._options.host,
+                                          self._options.port),
+                                         custom.jsoncontent())
+            else:
+                if self._ti.get('salts'):
+                    self._salts_client = SaltsClient(self._ti.get('api_url'),
+                                                    self._ti.get('api_key'),
+                                                    self._options.lt_path)
+                client = TankClient(self._options.host, self._options.port)
+                self._check_for_running(client)
+                resp = None
+                with open(self._ti.get('file_path')) as ini_file:
+                    resp = client.run(ini_file.read(), 'start')
+                self._ti['session_id'] = resp.get('session')
+                self._logger.info("Session %s: the test started." \
+                                  % self._ti.get('session_id'))
+                self._wait_for_completed(client, self._ti.get('session_id'), False)
+                client.resume(self._ti.get('session_id'))
+                self._wait_for_completed(client, self._ti.get('session_id'), True)
+                self._logger.info("Session %s: the test finished." \
+                                  % self._ti.get('session_id'))
+            self._ti = None
+        except Exception, exc:
+            self._logger.warning(exc)
+        self._salts_client = None
+
+
+def main():
+    sr = None
+    try:
+        options = parse_options()
+        if options.version:
+            print "RunLoad version %s" % pkg_resources.get_distribution("RunLoad").version
+            exit(0)
+        sr = SeriesRunner(options)
+        if options.git_pull:
+            sr.git_pull()
+        sr.run()
+        sr.remove_expired()
+    except Exception:
+        import traceback
+        import StringIO
+        output = StringIO.StringIO()
+        traceback.print_exc(None, output)
+        if sr:
+            sr.logger().error(output.getvalue())
+        else:
+            logging.getLogger(__name__).error(output.getvalue())
+    else:
+        if sr:
+            sr.logger().info("RunLoad finished successfully.")
+
+
+if __name__ == "__main__":
+    main()
