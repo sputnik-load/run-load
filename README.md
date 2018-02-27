@@ -10,8 +10,9 @@ pip install --upgrade pip`
 
 - Ставим утилиту:
 
-`PyPIHOST=<PyPI with runload package>`
-`pip install --trusted-host <PyPIHost> --index-url http://<PyPIHost>:8080/simple/ --upgrade runload`
+`PyPIHost=<PyPI with runload package>`
+
+`pip install --trusted-host $PyPIHost --index-url http://$PyPIHost:8080/simple/ --upgrade runload`
 
 **Запуск**
 
@@ -22,4 +23,4 @@ pip install --upgrade pip`
 **Наблюдение**
 
 Во время теста результаты можно смотреть, например, по порту 8001 на соответствующей нагрузочной станции (хост из ключа `-s` при запуске `runload`; порт должен быть указан в опции `port` секции `[sputnikonline]` ini файла):
-- http://<tank-server>:8001
+- http://\<tank-server\>:8001
