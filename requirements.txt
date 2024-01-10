@@ -1,4 +1,4 @@
-gitpython==3.1.37
+gitpython==3.1.41
 simplejson==3.8.2
 requests==2.31.0
 slumber==0.7.1
